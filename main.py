@@ -2,7 +2,6 @@ import telebot
 
 TOKEN = "8912217606:AAFAxQKalVqR1RoDNB0zNP41LfZHJn0XXzU"
 
-# Создаём экземпляр бота
 bot = telebot.TeleBot(TOKEN)
 
 # Обработчик команды /start
