@@ -12,7 +12,6 @@ DB_LOCK = threading.Lock()
 def get_db_connection():
     return sqlite3.connect('tamagochi.db', timeout=10)
 
-
 def init_db():
     """Создаёт таблицу питомцев с автоинкрементом ID (сохраняет историю)"""
     with DB_LOCK:
