@@ -5,15 +5,14 @@ import threading
 TOKEN = ""
 bot = telebot.TeleBot(TOKEN)
 
-# ============ БЛОКИРОВКА И НАСТРОЙКА БД ============
 DB_LOCK = threading.Lock()
 
 
 def get_db_connection():
     return sqlite3.connect('tamagochi.db', timeout=10)
 
+
 def init_db():
-    """Создаёт таблицу питомцев с автоинкрементом ID (сохраняет историю)"""
     with DB_LOCK:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -55,14 +54,10 @@ def init_db():
         print("✅ База данных готова!")
 
 
-# Инициализируем БД при запуске
 init_db()
 
 
-# ============ УНИВЕРСАЛЬНЫЕ ФУНКЦИИ РАБОТЫ С БД ============
-
 def get_active_pet(user_id):
-    """Ищет ТОЛЬКО ЖИВОГО питомца конкретного пользователя"""
     with DB_LOCK:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -78,7 +73,6 @@ def get_active_pet(user_id):
 
 
 def create_pet(user_id, name):
-    """Создает абсолютно новую запись питомца (старые мертвые не перезаписываются)"""
     with DB_LOCK:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -91,17 +85,11 @@ def create_pet(user_id, name):
 
 
 def update_pet_stats(user_id, **kwargs):
-    """
-    Универсальная функция обновления любых параметров живого питомца за один запрос.
-    Пример: update_pet_stats(user_id, hunger=70, happiness=60)
-    """
     if not kwargs:
         return
-
-    # Динамически собираем SQL-запрос под переданные параметры
     set_clause = ", ".join([f"{key} = ?" for key in kwargs.keys()])
     values = list(kwargs.values())
-    values.append(user_id)  # Для условия WHERE user_id = ?
+    values.append(user_id)
 
     with DB_LOCK:
         conn = get_db_connection()
@@ -115,14 +103,11 @@ def update_pet_stats(user_id, **kwargs):
         conn.close()
 
 
-# ============ КОМАНДЫ БОТА ============
-
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
     pet = get_active_pet(user_id)
 
-    # Если живого питомца нет — предлагаем ввести имя и завести нового
     if pet is None:
         msg = bot.send_message(
             message.chat.id,
@@ -142,22 +127,18 @@ def start(message):
 
 
 def process_name_step(message):
-    """Перехватывает текстовый ответ пользователя и сохраняет имя"""
     user_id = message.from_user.id
     pet_name = message.text.strip()
 
-    # Проверка на случай, если пользователь вместо имени ввёл другую команду
     if pet_name.startswith('/'):
         bot.send_message(message.chat.id, "❌ Имя не должно начинаться с команды! Введи нормальное имя через /start.")
         return
 
-    # Валидация длины
     if len(pet_name) > 20:
         msg = bot.send_message(message.chat.id, "⚠️ Слишком длинное имя! Давай покороче (до 20 символов):")
         bot.register_next_step_handler(msg, process_name_step)
         return
 
-    # Создаем питомца в БД (старые мертвые остаются в базе)
     create_pet(user_id, pet_name)
 
     bot.send_message(
@@ -179,7 +160,6 @@ def feed(message):
 
     user_id, name, hunger, happiness, energy, is_alive = pet
 
-    # Проверяем лимит сытости
     if hunger >= 100:
         bot.send_message(message.chat.id, f"🍔 {name} уже сыт! Не перекармливай.")
         return
@@ -187,7 +167,6 @@ def feed(message):
     new_hunger = min(100, hunger + 20)
     new_happiness = min(100, happiness + 5)
 
-    # Обновляем все статы ОДНИМ вызовом универсальной функции
     update_pet_stats(user_id, hunger=new_hunger, happiness=new_happiness)
 
     bot.send_message(
@@ -223,7 +202,6 @@ def status(message):
     bot.send_message(message.chat.id, status_text, parse_mode="Markdown")
 
 
-# Запуск бота
 if __name__ == "__main__":
     print("🤖 Бот запущен...")
     bot.infinity_polling()
