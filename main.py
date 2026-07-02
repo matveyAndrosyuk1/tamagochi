@@ -1,32 +1,43 @@
 import telebot
 import sqlite3
+import threading
 from datetime import datetime
 
 TOKEN = ""
 bot = telebot.TeleBot(TOKEN)
 
+# ============ БЛОКИРОВКА ДЛЯ БД ============
+DB_LOCK = threading.Lock()
+
+def get_db_connection():
+    """Создаёт соединение с БД с таймаутом"""
+    return sqlite3.connect('tamagochi.db', timeout=10)
 
 # ============ СОЗДАНИЕ ТАБЛИЦЫ ============
 
 def init_db():
     """Создаёт таблицу питомцев если её нет"""
-    conn = sqlite3.connect('tamagochi.db')
-    cursor = conn.cursor()
+    with DB_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
 
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS pets (
-            user_id INTEGER PRIMARY KEY,
-            name TEXT DEFAULT 'Питомец',
-            hunger INTEGER DEFAULT 50,
-            happiness INTEGER DEFAULT 50,
-            energy INTEGER DEFAULT 100,
-            is_alive BOOLEAN DEFAULT 1
-        )
-    ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pets (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT DEFAULT 'Питомец',
+                hunger INTEGER DEFAULT 50,
+                happiness INTEGER DEFAULT 50,
+                energy INTEGER DEFAULT 100,
+                is_alive BOOLEAN DEFAULT 1
+            )
+        ''')
 
-    conn.commit()
-    conn.close()
-    print("✅ База данных готова!")
+        # Включаем WAL-режим для лучшей работы с многопоточностью
+        cursor.execute('PRAGMA journal_mode=WAL')
+
+        conn.commit()
+        conn.close()
+        print("✅ База данных готова!")
 
 
 # Вызываем при запуске
@@ -37,54 +48,50 @@ init_db()
 
 def get_pet(user_id):
     """Получить данные питомца из БД"""
-    conn = sqlite3.connect('tamagochi.db')
-    cursor = conn.cursor()
-
-    cursor.execute('SELECT * FROM pets WHERE user_id = ?', (user_id,))
-    data = cursor.fetchone()
-    conn.close()
-
-    return data
+    with DB_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM pets WHERE user_id = ?', (user_id,))
+        data = cursor.fetchone()
+        conn.close()
+        return data
 
 
 def create_pet(user_id, name="Питомец"):
     """Создать нового питомца"""
-    conn = sqlite3.connect('tamagochi.db')
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        INSERT OR IGNORE INTO pets (user_id, name)
-        VALUES (?, ?)
-    ''', (user_id, name))
-
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR IGNORE INTO pets (user_id, name)
+            VALUES (?, ?)
+        ''', (user_id, name))
+        conn.commit()
+        conn.close()
 
 
 def update_hunger(user_id, new_value):
     """Обновить уровень голода"""
-    conn = sqlite3.connect('tamagochi.db')
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        UPDATE pets SET hunger = ? WHERE user_id = ?
-    ''', (new_value, user_id))
-
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE pets SET hunger = ? WHERE user_id = ?
+        ''', (new_value, user_id))
+        conn.commit()
+        conn.close()
 
 
 def update_happiness(user_id, new_value):
     """Обновить уровень счастья"""
-    conn = sqlite3.connect('tamagochi.db')
-    cursor = conn.cursor()
-
-    cursor.execute('''
-        UPDATE pets SET happiness = ? WHERE user_id = ?
-    ''', (new_value, user_id))
-
-    conn.commit()
-    conn.close()
+    with DB_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE pets SET happiness = ? WHERE user_id = ?
+        ''', (new_value, user_id))
+        conn.commit()
+        conn.close()
 
 
 # ============ КОМАНДЫ БОТА ============
