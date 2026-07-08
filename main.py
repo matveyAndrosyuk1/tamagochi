@@ -113,11 +113,13 @@ def update_pet_stats(user_id, **kwargs):
 
 
 def change_balance(user_id, amount):
-    """Изменить баланс питомца на amount (может быть отрицательным)"""
+    """Изменить баланс питомца на amount (может быть отрицательным) с защитой от минуса"""
     pet = get_active_pet(user_id)
     if pet:
         user_id, name, hunger, happiness, energy, is_alive, balance, last_activity = pet
         new_balance = balance + amount
+        if new_balance < 0:
+            new_balance = 0
         update_pet_stats(user_id, balance=new_balance)
         return new_balance
     return None
@@ -656,44 +658,51 @@ def handle_buy(call):
 
     item = items[item_name]
 
-    pet = get_active_pet(user_id)
-    if pet is None:
-        bot.answer_callback_query(call.id, "❌ У тебя нет питомца!", show_alert=True)
-        return
+    # Критический участок: проверка и списание защищены LOCK
+    with DB_LOCK:
+        pet = get_active_pet(user_id)
+        if pet is None:
+            bot.answer_callback_query(call.id, "❌ У тебя нет питомца!", show_alert=True)
+            return
 
-    user_id, name, hunger, happiness, energy, is_alive, balance, last_activity = pet
+        user_id, name, hunger, happiness, energy, is_alive, balance, last_activity = pet
 
-    if balance < item["price"]:
-        bot.answer_callback_query(
-            call.id,
-            f"❌ Недостаточно монет! Нужно: {item['price']}, у тебя: {balance}",
-            show_alert=True
-        )
-        return
+        if balance < item["price"]:
+            bot.answer_callback_query(
+                call.id,
+                f"❌ Недостаточно монет! Нужно: {item['price']}, у тебя: {balance}",
+                show_alert=True
+            )
+            return
 
-    new_balance = change_balance(user_id, -item["price"])
-    new_hunger = min(100, hunger + item["hunger"])
-    update_pet_stats(user_id, hunger=new_hunger)
+        # Списываем баланс внутри лока
+        new_balance = balance - item["price"]
 
-    if item["happiness"] > 0:
-        new_happiness = min(100, happiness + item["happiness"])
-        update_pet_stats(user_id, happiness=new_happiness)
+        new_hunger = min(100, hunger + item["hunger"])
+        new_happiness = happiness
+        if item["happiness"] > 0:
+            new_happiness = min(100, happiness + item["happiness"])
+
+        # Апдейтим БД напрямую, чтобы избежать гонки потоков
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+                       UPDATE pets
+                       SET balance       = ?,
+                           hunger        = ?,
+                           happiness     = ?,
+                           last_activity = ?
+                       WHERE user_id = ?
+                         AND is_alive = 1
+                       ''', (new_balance, new_hunger, new_happiness, datetime.now().isoformat(), user_id))
+        conn.commit()
+        conn.close()
 
     emojis = {
-        "яблоко": "🍎",
-        "банан": "🍌",
-        "морковка": "🥕",
-        "куриная ножка": "🍗",
-        "рыбка": "🐟",
-        "стейк": "🥩",
-        "пицца": "🍕",
-        "суши": "🍣",
-        "мороженое": "🍦",
-        "печенье": "🍪",
-        "сок": "🧃",
-        "молоко": "🥛",
-        "домашний обед": "🧺",
-        "гурме-набор": "🎁"
+        "яблоко": "🍎", "банан": "🍌", "морковка": "🥕", "куриная ножка": "🍗",
+        "рыбка": "🐟", "стейк": "🥩", "пицца": "🍕", "суши": "🍣",
+        "мороженое": "🍦", "печенье": "🍪", "сок": "🧃", "молоко": "🥛",
+        "домашний обед": "🧺", "гурме-набор": "🎁"
     }
     emoji = emojis.get(item_name, "🍖")
 
@@ -820,6 +829,124 @@ def handle_guess(call):
         bot.answer_callback_query(call.id, f"❌ Не угадал! -5 монет. Попробуй ещё!")
 
 
+
+#=========== == ========== === = = === = = = == = =  ==  = === =
+active_games = {}
+active_rps_games = {}  # Хранилище для игры камень-ножницы-бумага
+
+
+@bot.message_handler(commands=['rps'])
+def start_rps_game(message):
+    user_id = message.from_user.id
+    pet = get_active_pet(user_id)
+
+    if pet is None:
+        bot.send_message(message.chat.id, "❌ У тебя нет питомца! Используй /start")
+        return
+
+    # Проверяем баланс перед игрой (нужно хотя бы 5 монет)
+    user_id, name, hunger, happiness, energy, is_alive, balance, last_activity = pet
+    if balance < 5:
+        bot.send_message(message.chat.id, "❌ У тебя слишком мало монет, чтобы играть (минимум 5)!")
+        return
+
+    # Регистрируем сессию игры для пользователя
+    active_rps_games[user_id] = True
+
+    markup = InlineKeyboardMarkup(row_width=3)
+    btn_rock = InlineKeyboardButton("🪨 Камень", callback_data="rps_rock")
+    btn_scissors = InlineKeyboardButton("✂️ Ножницы", callback_data="rps_scissors")
+    btn_paper = InlineKeyboardButton("📄 Бумага", callback_data="rps_paper")
+    btn_giveup = InlineKeyboardButton("🏳️ Сдаться", callback_data="rps_giveup")
+
+    markup.add(btn_rock, btn_scissors, btn_paper)
+    markup.add(btn_giveup)
+
+    bot.send_message(
+        message.chat.id,
+        f"✊✌️✋ **Камень, Ножницы, Бумага!**\n\n"
+        f"Сыграй против ИИ бота!\n"
+        f"💰 Награда за победу: **15 монет**\n"
+        f"📉 Проигрыш: -5 монет\n"
+        f"🤝 Ничья: 0 монет\n\n"
+        f"Сделай свой ход:",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rps_'))
+def handle_rps(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+
+    if user_id not in active_rps_games:
+        bot.answer_callback_query(call.id, "❌ Игра не найдена! Начни новую /rps", show_alert=True)
+        return
+
+    if call.data == "rps_giveup":
+        del active_rps_games[user_id]
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="🏳️ Ты отказался от игры!\n\nИспользуй /rps чтобы начать заново.",
+            parse_mode="Markdown"
+        )
+        bot.answer_callback_query(call.id, "Ты сдался!")
+        return
+
+    # Ход игрока
+    player_choice = call.data.split('_')[1]
+
+    # Ход ИИ бота
+    choices = ["rock", "scissors", "paper"]
+    bot_choice = random.choice(choices)
+
+    ru_names = {"rock": "🪨 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+
+    # Проверяем баланс перед расчетом (на случай, если списали в другом месте)
+    pet = get_active_pet(user_id)
+    if pet is None:
+        del active_rps_games[user_id]
+        bot.answer_callback_query(call.id, "❌ Питомец не найден!")
+        return
+
+    # Логика игры
+    # Ничья
+    if player_choice == bot_choice:
+        result_text = "🤝 **Ничья!** никто ничего не потерял."
+        alert_msg = "🤝 Ничья!"
+        new_balance = pet[6]  # баланс не меняется
+    # Победа игрока
+    elif (player_choice == "rock" and bot_choice == "scissors") or \
+            (player_choice == "scissors" and bot_choice == "paper") or \
+            (player_choice == "paper" and bot_choice == "rock"):
+        new_balance = change_balance(user_id, 15)
+        result_text = f"🎉 **ПОЗДРАВЛЯЮ! Ты победил противника!**\n💰 Ты получил **15 монет**!"
+        alert_msg = "🎉 Победа! +15 монет!"
+    # Проигрыш игрока
+    else:
+        new_balance = change_balance(user_id, -5)
+        result_text = f"❌ **Увы, ты проиграл!** Бот оказался хитрее.\n💰 Списано **5 монет**."
+        alert_msg = "❌ Проигрыш! -5 монет."
+
+    # Закрываем сессию игры
+    del active_rps_games[user_id]
+
+    bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=call.message.message_id,
+        text=f"✊✌️✋ **Результаты игры:**\n\n"
+             f"🧑 Твой ход: **{ru_names[player_choice]}**\n"
+             f"🤖 Ход соперника: **{ru_names[bot_choice]}**\n\n"
+             f"{result_text}\n"
+             f"💰 Новый баланс: **{new_balance}** монет\n\n"
+             f"Хочешь реванш? Жми /rps",
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, alert_msg)
+
+
 @bot.message_handler(commands=['guess_stats'])
 def guess_stats(message):
     user_id = message.from_user.id
@@ -846,7 +973,7 @@ def guess_stats(message):
 
 if __name__ == "__main__":
     print("🤖 Бот-тамагочи запущен!")
-    print("🎮 Игра 'Угадай число' активна!")
+    print("🎮 Игра 'Угадай число' и 'КНБ' активны!")
     print("🔄 Голод -5, Счастье -3, Энергия -2 каждые 10 минут!")
-    print("📊 Доступные команды: /start, /status, /feed, /sleep, /play, /guess, /guess_stats, /shop")
+    print("📊 Доступные команды: /start, /status, /feed, /sleep, /play, /guess, /rps, /guess_stats, /shop")
     bot.infinity_polling()
