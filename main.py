@@ -52,6 +52,18 @@ def init_db():
             )
         ''')
 
+        # === АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ ДЛЯ ЕЖЕДНЕВНОГО БОНУСА ===
+        try:
+            cursor.execute("ALTER TABLE pets ADD COLUMN bonus_streak INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # Если колонка уже есть, пропускаем
+
+        try:
+            cursor.execute("ALTER TABLE pets ADD COLUMN last_bonus_time TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
+        # =======================================================
+
         cursor.execute('PRAGMA journal_mode=WAL')
         conn.commit()
         conn.close()
@@ -969,6 +981,167 @@ def guess_stats(message):
         f"📝 Чтобы сыграть, используй /guess",
         parse_mode="Markdown"
     )
+
+#==================================================================
+
+@bot.message_handler(commands=['bonus'])
+def daily_bonus_menu(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    pet = get_active_pet(user_id)
+    if pet is None:
+        bot.send_message(chat_id, "❌ У тебя нет питомца! Используй /start")
+        return
+
+    # Запрашиваем актуальные данные бонусов из БД под замком
+    with DB_LOCK:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT bonus_streak, last_bonus_time, balance FROM pets WHERE user_id = ? AND is_alive = 1",
+                       (user_id,))
+        res = cursor.fetchone()
+        conn.close()
+
+    if not res:
+        return
+
+    streak, last_bonus_str, balance = res
+    now = datetime.now()
+
+    can_claim = False
+    time_left_str = ""
+
+    if last_bonus_str is None:
+        # Игрок вообще ни разу не брал бонус
+        can_claim = True
+    else:
+        last_bonus_time = datetime.fromisoformat(last_bonus_str)
+        # Считаем разницу в днях на основе чистых дат (без учета часов, чтобы сброс был в полночь или ровно через 24ч)
+        # В данном случае делаем честные 24 часа для кнопки "Забрать":
+        time_passed = now - last_bonus_time
+
+        if time_passed >= timedelta(hours=24):
+            can_claim = True
+            # Проверка на пропуск дней: если прошло больше 48 часов, стрик сгорает
+            if time_passed >= timedelta(hours=48):
+                streak = 0
+        else:
+            can_claim = False
+            # Вычисляем сколько осталось спать таймеру (ЧЧ:ММ:СС)
+            time_left = timedelta(hours=24) - time_passed
+            hours, remainder = divmod(int(time_left.total_seconds()), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            time_left_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    # Расчет будущей награды (прогресс)
+    display_streak = streak if not can_claim else (streak + 1)
+    next_milestone = ((display_streak - 1) // 10 + 1) * 10
+    days_in_current_ten = display_streak % 10 if display_streak % 10 != 0 else 10
+
+    # Сумма награды по формуле
+    reward = 50 if display_streak % 10 == 0 else 10
+
+    # Визуальный индикатор прогресса (ProgressBar)
+    progress_bar = "🟩" * days_in_current_ten + "⬜" * (10 - days_in_current_ten)
+
+    # Интерфейс (UI)
+    text = (
+        f"🎁 **ЕЖЕДНЕВНЫЙ БОНУС** 🎁\n\n"
+        f"🔥 Текущий стрик: **{display_streak} дн.**\n"
+        f"📊 До супер-награды (50 💰): **{10 - days_in_current_ten} дн.**\n"
+        f"🗺️ Прогресс текущего цикла:\n"
+        f"|{progress_bar}| {days_in_current_ten}/10\n\n"
+        f"💰 Сегодняшняя награда: **{reward} монет**\n"
+    )
+
+    markup = InlineKeyboardMarkup()
+    if can_claim:
+        btn_claim = InlineKeyboardButton("🎁 Забрать бонус!", callback_data="claim_daily_bonus")
+        markup.add(btn_claim)
+    else:
+        text += f"\n⏳ Следующий бонус будет доступен через: `{time_left_str}`"
+        btn_disabled = InlineKeyboardButton("🔒 Уже получено", callback_data="bonus_disabled")
+        markup.add(btn_disabled)
+
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'claim_daily_bonus')
+    def handle_claim_bonus(call):
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+        now = datetime.now()
+
+        with DB_LOCK:
+            # 1. Защита: проверяем статус заново внутри лока
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT bonus_streak, last_bonus_time, balance FROM pets WHERE user_id = ? AND is_alive = 1",
+                           (user_id,))
+            res = cursor.fetchone()
+
+            if not res:
+                bot.answer_callback_query(call.id, "❌ Питомец не найден!", show_alert=True)
+                conn.close()
+                return
+
+            streak, last_bonus_str, balance = res
+
+            # Проверяем тайм-лимит еще раз
+            if last_bonus_str is not None:
+                last_bonus_time = datetime.fromisoformat(last_bonus_str)
+                if now - last_bonus_time < timedelta(hours=24):
+                    bot.answer_callback_query(call.id, "⏳ Секундочку! Бонус еще не остыл.", show_alert=True)
+                    conn.close()
+                    return
+
+                # Проверка на сброс стрика (если пропустил больше суток поверх нормы)
+                if now - last_bonus_time >= timedelta(hours=48):
+                    streak = 0
+
+            # 2. Логика начисления: увеличиваем стрик
+            new_streak = streak + 1
+
+            # Рассчитываем сумму по формуле
+            reward = 50 if new_streak % 10 == 0 else 10
+            new_balance = balance + reward
+
+            # 3. Апдейтим БД
+            cursor.execute('''
+                           UPDATE pets
+                           SET bonus_streak    = ?,
+                               last_bonus_time = ?,
+                               balance         = ?
+                           WHERE user_id = ?
+                             AND is_alive = 1
+                           ''', (new_streak, now.isoformat(), new_balance, user_id))
+            conn.commit()
+            conn.close()
+
+        # 5. Дополнительно (визуальный фидбек / анимация текстом)
+        congratulations = (
+            f"✨ **БАМ! АНИМАЦИЯ НАЧИСЛЕНИЯ** ✨\n"
+            f"🪙    ✨    🪙    ✨    🪙\n"
+            f"    🪙    **+{reward} 💰**    🪙\n"
+            f"🪙    ✨    🪙    ✨    🪙\n\n"
+            f"🎉 Ты успешно забрал ежедневный бонус!\n"
+            f"🔥 Твой стрик вырос до **{new_streak}** дней подряд.\n"
+            f"💰 Баланс пополнен: **{new_balance}** монет."
+        )
+
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=congratulations,
+            parse_mode="Markdown"
+        )
+
+        bot.answer_callback_query(call.id, f"➕ Начислено {reward} монет! Стрик: {new_streak} дней.", show_alert=False)
+
+    @bot.callback_query_handler(func=lambda call: call.data == 'bonus_disabled')
+    def handle_disabled_bonus_click(call):
+        bot.answer_callback_query(call.id, "⏳ Кнопка заблокирована! Загляни сюда позже.",
+                                  show_alert=True)
 
 
 if __name__ == "__main__":
